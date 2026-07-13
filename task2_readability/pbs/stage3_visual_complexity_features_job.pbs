@@ -1,0 +1,39 @@
+#!/bin/bash
+#PBS -N task2_stage3_visual
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+#PBS -W umask=022
+
+source /etc/profile.d/modules.sh
+
+module purge
+module load python/python-3.12.4
+
+PROJECT_ROOT="./task2_readability"
+PADDLE_ENV="./environments/paddleocr_env"
+
+mkdir -p "${PROJECT_ROOT}/logs"
+mkdir -p "${PROJECT_ROOT}/output/stage3_visual_complexity_features"
+mkdir -p "${PROJECT_ROOT}/tmp"
+
+export TMPDIR="${PROJECT_ROOT}/tmp"
+export TMP="${PROJECT_ROOT}/tmp"
+export TEMP="${PROJECT_ROOT}/tmp"
+
+export OMP_NUM_THREADS=1
+export PYTHONDONTWRITEBYTECODE=1
+
+cd "${PROJECT_ROOT}"
+
+echo "============================================================"
+echo "RUNNING STAGE 3 VISUAL COMPLEXITY AND LAYOUT ANALYSIS"
+echo "Time: $(date)"
+echo "Host: $(hostname)"
+echo "============================================================"
+
+"${PADDLE_ENV}/bin/python" -c "import cv2, PIL, numpy; print('cv2 ok'); print('PIL ok'); print('numpy ok')"
+
+FORCE_RESTART=1 "${PADDLE_ENV}/bin/python" -u \
+"${PROJECT_ROOT}/codes/stage3_visual_complexity_features.py"

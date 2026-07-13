@@ -1,0 +1,24 @@
+#!/bin/bash
+#PBS -N task2_stage1_preprocessing
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=10:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+#PBS -e ./logs/job.err
+#PBS -W umask=022
+
+source ~/.bashrc
+
+module load python/python-3.13.5
+
+cd ./task2_readability
+
+mkdir -p ./task2_readability/logs
+mkdir -p ./task2_readability/output/stage1_preprocessing/index
+mkdir -p ./task2_readability/output/stage1_preprocessing/image_metadata
+mkdir -p ./task2_readability/output/stage1_preprocessing/duplicates
+mkdir -p ./task2_readability/output/stage1_preprocessing/summaries
+mkdir -p ./task2_readability/output/stage1_preprocessing/reports
+
+./environments/llm_env/bin/python3 -u \
+./task2_readability/codes/stage1_preprocessing.py

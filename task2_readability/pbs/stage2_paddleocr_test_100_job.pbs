@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N task2_paddleocr_test_100
+#PBS -l select=1:ncpus=8:ngpus=1:mem=32gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+#PBS -W umask=022
+
+source /etc/profile.d/modules.sh
+
+module purge
+module load python/python-3.12.4
+
+PROJECT_ROOT="./task2_readability"
+PADDLE_ENV="./environments/paddleocr_env"
+
+mkdir -p "${PROJECT_ROOT}/logs"
+mkdir -p "${PROJECT_ROOT}/output/stage2_ocr_test_100"
+mkdir -p "${PROJECT_ROOT}/tmp"
+mkdir -p "${PROJECT_ROOT}/dependencies/paddleocr_models"
+
+export TMPDIR="${PROJECT_ROOT}/tmp"
+export TMP="${PROJECT_ROOT}/tmp"
+export TEMP="${PROJECT_ROOT}/tmp"
+
+export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+export HF_HOME="${PROJECT_ROOT}/dependencies/paddleocr_models"
+export PADDLE_HOME="${PROJECT_ROOT}/dependencies/paddleocr_models"
+export XDG_CACHE_HOME="${PROJECT_ROOT}/dependencies/paddleocr_models"
+
+export OMP_NUM_THREADS=1
+export PYTHONDONTWRITEBYTECODE=1
+
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES=0
+fi
+
+cd "${PROJECT_ROOT}"
+
+echo "============================================================"
+echo "GPU CHECK"
+echo "Time: $(date)"
+echo "Host: $(hostname)"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+nvidia-smi
+echo "============================================================"
+
+"${PADDLE_ENV}/bin/python" -c "import paddle; print('paddle version:', paddle.__version__); print('cuda compiled:', paddle.device.is_compiled_with_cuda()); print('gpu count:', paddle.device.cuda.device_count())"
+
+echo "============================================================"
+echo "RUNNING STAGE 2 OCR TEST"
+echo "============================================================"
+
+"${PADDLE_ENV}/bin/python" -u \
+"${PROJECT_ROOT}/codes/stage2_paddleocr_test_100.py"

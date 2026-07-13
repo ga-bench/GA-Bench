@@ -1,0 +1,165 @@
+#!/bin/bash
+#PBS -N ga_parser_v13_tablefix
+#PBS -l select=2:ncpus=64:mem=128gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+
+set -u
+
+echo "=== JOB START $(date) ==="
+echo "PBS_JOBID=${PBS_JOBID:-unknown}"
+echo "HOST=$(hostname)"
+
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load python/python-3.13.5 2>&1
+module load java/jdk-17 2>&1
+module load singularity 2>&1 || true
+
+BASE_DIR=./grobid_parser
+SRC_DIR=$BASE_DIR/src
+PBS_DIR=$BASE_DIR/pbs
+DATASET_ROOT=./dataset
+PYTHON=./environments/ParserEnv/bin/python
+JAR_PATH=$BASE_DIR/bin/pdffigures2.jar
+GROBID_SIF=$BASE_DIR/singularity_images/grobid.sif
+LOGS_DIR=$BASE_DIR/logs
+STATE_DIR=$BASE_DIR/state
+WORK_QUEUE=$STATE_DIR/work_queue_v13_tablefix
+
+GROBID_PORT=8070
+
+export OCR_ENABLED=1
+export OCR_TABLE_ENGINE=rapidocr
+export OCR_EQUATION_ENGINE=pix2tex
+
+WORKERS_PER_NODE=32
+
+mkdir -p "$LOGS_DIR"
+mkdir -p "$STATE_DIR"
+
+cd "$SRC_DIR" || exit 1
+
+echo "=== Paths ==="
+echo "BASE_DIR=$BASE_DIR"
+echo "SRC_DIR=$SRC_DIR"
+echo "PBS_DIR=$PBS_DIR"
+echo "DATASET_ROOT=$DATASET_ROOT"
+echo "PYTHON=$PYTHON"
+echo "JAR_PATH=$JAR_PATH"
+echo "GROBID_SIF=$GROBID_SIF"
+echo "WORK_QUEUE=$WORK_QUEUE"
+
+echo "=== Sanity checks ==="
+"$PYTHON" -m py_compile coordinator.py worker.py imrad_classifier.py output_writer.py tei_parser.py table_text_extractor.py ocr_engine.py label_utils.py figure_validator.py figure_section_mapper.py grobid_figure_fallback.py pdffigures2_runner.py pua_remap.py pymupdf_fallback.py equation_extractor.py pdf_text_locator.py table_quality.py equation_quality.py || exit 1
+bash -n "$PBS_DIR/launch_grobid.sh" || exit 1
+bash -n "$PBS_DIR/launch_workers.sh" || exit 1
+
+echo "=== Build queue (DOI folders directly under dataset root) ==="
+"$PYTHON" "$SRC_DIR/coordinator.py" build \
+    --dataset-root "$DATASET_ROOT" \
+    --db "$WORK_QUEUE" || exit 1
+
+"$PYTHON" "$SRC_DIR/coordinator.py" reset-orphans \
+    --db "$WORK_QUEUE" || true
+
+"$PYTHON" "$SRC_DIR/coordinator.py" status \
+    --db "$WORK_QUEUE" || true
+
+NODELIST=$STATE_DIR/nodes_full_${PBS_JOBID:-manual}.txt
+
+if [ -n "${PBS_NODEFILE:-}" ] && [ -s "$PBS_NODEFILE" ]; then
+    sort -u "$PBS_NODEFILE" > "$NODELIST"
+else
+    hostname > "$NODELIST"
+fi
+
+if [ ! -s "$NODELIST" ]; then
+    echo "ERROR: NODELIST is empty"
+    exit 1
+fi
+
+echo "=== Allocated nodes ==="
+cat "$NODELIST"
+
+finish() {
+    echo "=== Finish/Cleanup $(date) ==="
+
+    "$PYTHON" "$SRC_DIR/coordinator.py" write-master \
+        --db "$WORK_QUEUE" \
+        --out-dir "$STATE_DIR" || true
+
+    "$PYTHON" "$SRC_DIR/coordinator.py" status \
+        --db "$WORK_QUEUE" || true
+
+    if [ -f "$NODELIST" ]; then
+        while read -r NODE; do
+            echo "Cleaning node $NODE"
+            ssh -o StrictHostKeyChecking=no "$NODE" "pkill -f 'worker.py loop' 2>/dev/null || true; pkill -f 'grobid-service' 2>/dev/null || true" || true
+        done < "$NODELIST"
+    fi
+}
+trap finish EXIT TERM INT
+
+echo "=== Launch GROBID ==="
+while read -r NODE; do
+    echo "Launching GROBID on $NODE"
+    ssh -o StrictHostKeyChecking=no "$NODE" "
+        source /etc/profile.d/modules.sh 2>/dev/null || true
+        module load singularity 2>&1 || true
+        bash '$PBS_DIR/launch_grobid.sh' '$GROBID_SIF' '$LOGS_DIR/grobid_${NODE}.log'
+    " || exit 1
+done < "$NODELIST"
+
+echo "=== Wait for GROBID health ==="
+while read -r NODE; do
+    echo "Checking GROBID on $NODE"
+    ssh -o StrictHostKeyChecking=no "$NODE" "
+        for i in \$(seq 1 60); do
+            curl -sf 'http://localhost:$GROBID_PORT/api/isalive' >/dev/null 2>&1 && exit 0
+            sleep 3
+        done
+        echo 'GROBID did not become healthy on $NODE'
+        tail -80 '$LOGS_DIR/grobid_${NODE}.log' 2>/dev/null || true
+        exit 1
+    " || exit 1
+done < "$NODELIST"
+
+echo "=== Launch workers ==="
+while read -r NODE; do
+    echo "Launching workers on $NODE"
+    ssh -o StrictHostKeyChecking=no "$NODE" "
+        export OCR_ENABLED='$OCR_ENABLED'
+        export OCR_TABLE_ENGINE='$OCR_TABLE_ENGINE'
+        export OCR_EQUATION_ENGINE='$OCR_EQUATION_ENGINE'
+        bash '$PBS_DIR/launch_workers.sh' \
+            '$WORKERS_PER_NODE' \
+            '$PYTHON' \
+            '$SRC_DIR' \
+            'http://localhost:$GROBID_PORT' \
+            '$WORK_QUEUE' \
+            '$NODE' \
+            '$JAR_PATH' \
+            '$LOGS_DIR' \
+            'worker'
+    " || exit 1
+done < "$NODELIST"
+
+echo "=== Start monitor ==="
+"$PYTHON" "$SRC_DIR/coordinator.py" monitor \
+    --db "$WORK_QUEUE" \
+    --log "$LOGS_DIR/extraction_v13_live.log" \
+    --stats-json "$LOGS_DIR/extraction_v13_stats.json" \
+    --poll-interval 10 \
+    --stats-every 10
+
+echo "=== Queue drained; write master ==="
+"$PYTHON" "$SRC_DIR/coordinator.py" write-master \
+    --db "$WORK_QUEUE" \
+    --out-dir "$STATE_DIR"
+
+echo "=== Master files ==="
+ls -lh "$STATE_DIR"/extraction_master.* 2>/dev/null || true
+head -5 "$STATE_DIR"/extraction_master.csv 2>/dev/null || true
+
+echo "=== JOB END $(date) ==="

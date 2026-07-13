@@ -1,0 +1,269 @@
+#!/bin/bash
+#PBS -N iv25_t1_vB_s1
+#PBS -l select=1:ncpus=32:ngpus=1:mem=64gb
+#PBS -l walltime=240:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+
+###############################################################################
+# Task 1 / Variant B / Stage 1 SRP Inference  (MULTIMODAL: text + figures)
+# Model: InternVL2.5-26B-AWQ (4-bit AWQ)
+# Infra: SINGLE node, 1 GPU (A100 40GB), vLLM TP=1, NO Ray.
+# Images are sent as base64 by the Python script, so NO --allowed-local-media-path.
+#
+# Submit one PBS file as TWO jobs (each gets its own node), passing only HALF:
+#   qsub -v HALF=1 task1_variantB_stage1_internvl2_5_26b_job.pbs
+#   qsub -v HALF=2 task1_variantB_stage1_internvl2_5_26b_job.pbs
+# (Optional readable qstat name: add  -N q3vl_t1_vB_s1_h1 / _h2)
+#
+# Auto-counts CSV rows and splits the index range in half.
+# SRPs/raw/errors are shared (per-DOI, no overlap); reports+checkpoint are
+# per-half via RUN_TAG so the two jobs never clobber each other.
+###############################################################################
+
+set -euo pipefail
+ulimit -n 65535 2>/dev/null || true
+
+# ----------------------------------------------------------------------------
+# HALF -> index range + run tag (auto-split, no hardcoded midpoint)
+# ----------------------------------------------------------------------------
+HALF="${HALF:?Submit with -v HALF=1 or -v HALF=2}"
+
+# ----------------------------------------------------------------------------
+# Paths: inputs from ORIGINAL tree, outputs to NEW _awq tree
+# ----------------------------------------------------------------------------
+INPUT_BASE="./task1_completeness/variant_B"
+OUTPUT_BASE="./task1_completeness_awq/variant_B"
+
+CODE_DIR="${OUTPUT_BASE}/codes"
+PBS_DIR="${OUTPUT_BASE}/pbs"
+OUTPUT_DIR="${OUTPUT_BASE}/outputs/stage1/internvl2_5_26b"
+LOG_DIR="${OUTPUT_DIR}/logs"
+REPORT_DIR="${OUTPUT_DIR}/reports"
+SRP_DIR="${OUTPUT_DIR}/srps"
+RAW_DIR="${OUTPUT_DIR}/raw_outputs"
+ERROR_DIR="${OUTPUT_DIR}/errors"
+CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
+
+SCRIPT_PATH="${CODE_DIR}/task1_variantB_stage1_internvl2_5_26b_inference.py"
+SYSTEM_PROMPT_FILE="${INPUT_BASE}/system_prompts/task1_variantB_phase1_system_prompt.txt"
+FIGURE_PATHS_CSV="${INPUT_BASE}/user_prompts/task1_variantB_phase1_figure_paths.csv"
+
+# AWQ env (separate from the original llm_env, which the running jobs use)
+ENV_DIR="./environments/llm_env_awq"
+PYTHON_BIN="${ENV_DIR}/bin/python3"
+# Python.h headers live in the ORIGINAL env; reuse for Triton JIT.
+PYTHON_INCLUDE="./environments/llm_env/include/python3.12"
+
+MODEL_PATH="./models/awq/InternVL2_5-26B-AWQ"
+SERVED_MODEL_NAME="internvl2_5_26b"
+VLLM_PORT="8000"
+
+# vLLM AWQ settings.
+# Context raised to 40960 to match Gemma/Qwen Variant B (prompt-length parity).
+# InternVL's InternViT encoder spikes VRAM per-image at decode; at 0.97 util the
+# 15-image Variant B path previously OOM'd in intern_vit.py (GELU) at seqs=1 with
+# full tiling. The max_dynamic_patch:4 cap (added at server launch below) cuts
+# per-image encoder memory ~3x, which is what makes parallelism feasible now.
+# seqs=4 + CUDA graphs (enforce-eager removed) is the throughput config; if the
+# server OOMs in intern_vit.py at startup or mid-run, lower MAX_NUM_SEQS to 2
+# (and the script's DEFAULT_CONCURRENCY to match), then re-add --enforce-eager.
+MAX_MODEL_LEN="40960"
+MAX_NUM_SEQS="1"
+GPU_MEMORY_UTILIZATION="0.95"
+
+# Inference test controls. Full run: TEST_ARGS=""
+# Test: TEST_ARGS="--limit 1"  (applied WITHIN this half's range)
+TEST_ARGS=""
+MAX_IMAGES="15"  # at most 15 images/paper, matching server --limit-mm-per-prompt image:15
+
+mkdir -p "${LOG_DIR}" "${REPORT_DIR}" "${SRP_DIR}" "${RAW_DIR}" "${ERROR_DIR}" "${CHECKPOINT_DIR}" "${PBS_DIR}"
+
+# ----------------------------------------------------------------------------
+# Compute this half's index range from the CSV row count (minus header)
+# ----------------------------------------------------------------------------
+if [[ ! -f "${FIGURE_PATHS_CSV}" ]]; then
+    echo "ERROR: Figure paths CSV not found: ${FIGURE_PATHS_CSV}"
+    exit 1
+fi
+TOTAL=$(( $(wc -l < "${FIGURE_PATHS_CSV}") - 1 ))
+if [[ "${TOTAL}" -le 0 ]]; then
+    echo "ERROR: No data rows in ${FIGURE_PATHS_CSV}"
+    exit 1
+fi
+MID=$(( TOTAL / 2 ))
+if [[ "${HALF}" == "1" ]]; then
+    START_INDEX=0;       END_INDEX=${MID};    RUN_TAG="h1"
+elif [[ "${HALF}" == "2" ]]; then
+    START_INDEX=${MID};  END_INDEX=${TOTAL};  RUN_TAG="h2"
+else
+    echo "ERROR: HALF must be 1 or 2 (got '${HALF}')"; exit 1
+fi
+
+# Per-half logs so the two jobs never clobber each other.
+VLLM_LOG="${LOG_DIR}/vllm_server_${RUN_TAG}.log"
+LIVE_LOG="${LOG_DIR}/live_inference_${RUN_TAG}.log"
+JOB_LOG="${LOG_DIR}/job_${RUN_TAG}.log"
+
+exec > >(tee -a "${JOB_LOG}") 2>&1
+
+cleanup() {
+    echo
+    echo "============================================================"
+    echo "  CLEANUP (${RUN_TAG})  Time: $(date)"
+    echo "============================================================"
+    if [[ -n "${VLLM_PID:-}" ]]; then
+        if kill -0 "${VLLM_PID}" 2>/dev/null; then
+            echo "Stopping vLLM server PID ${VLLM_PID}..."
+            kill "${VLLM_PID}" 2>/dev/null || true
+            sleep 5
+            kill -9 "${VLLM_PID}" 2>/dev/null || true
+        fi
+    fi
+}
+trap cleanup EXIT
+
+echo "============================================================"
+echo "  PHASE 1: Environment Setup  (HALF=${HALF}, tag=${RUN_TAG})"
+echo "  Time: $(date)"
+echo "============================================================"
+
+source "${ENV_DIR}/bin/activate"
+
+# Per-half temp + Triton cache so the two jobs never race on JIT compiles.
+export TMPDIR="./.tmp/${RUN_TAG}"
+export TRITON_CACHE_DIR="./.triton_cache/${RUN_TAG}"
+export HF_HOME="./.cache/huggingface"
+mkdir -p "${TMPDIR}" "${TRITON_CACHE_DIR}" "${HF_HOME}"
+
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# Reduce CUDA allocator fragmentation so the InternViT encoder's per-image
+# activation spikes can reuse reserved-but-unallocated blocks (the OOM in
+# intern_vit.py reported ~1 GiB reserved-but-unallocated at the moment of death).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Keep startup stable + expose Python.h for Triton's JIT launcher
+# (fixes "fatal error: Python.h: No such file or directory").
+export VLLM_TORCH_COMPILE_LEVEL=0
+export TORCH_COMPILE_DISABLE=1
+export C_INCLUDE_PATH="${PYTHON_INCLUDE}:${C_INCLUDE_PATH:-}"
+export CPATH="${PYTHON_INCLUDE}:${CPATH:-}"
+
+echo "Hostname:          $(hostname)"
+echo "PBS job id:        ${PBS_JOBID:-unknown}"
+echo "HALF / tag:        ${HALF} / ${RUN_TAG}"
+echo "Total CSV rows:    ${TOTAL}"
+echo "Index range:       [${START_INDEX}, ${END_INDEX})"
+echo "Python:            $(${PYTHON_BIN} --version 2>&1)"
+echo "vLLM:              $(${PYTHON_BIN} -c 'import vllm; print(vllm.__version__)')"
+echo "PyTorch:           $(${PYTHON_BIN} -c 'import torch; print(torch.__version__)')"
+echo "CUDA:              $(${PYTHON_BIN} -c 'import torch; print(torch.version.cuda)')"
+echo "Model path:        ${MODEL_PATH}"
+echo "Served name:       ${SERVED_MODEL_NAME}"
+echo "Script path:       ${SCRIPT_PATH}"
+echo "System prompt:     ${SYSTEM_PROMPT_FILE}"
+echo "Figure paths CSV:  ${FIGURE_PATHS_CSV}"
+echo "Output dir:        ${OUTPUT_DIR}"
+echo "Max model len:     ${MAX_MODEL_LEN}"
+echo "GPU mem util:      ${GPU_MEMORY_UTILIZATION}"
+echo "Max images:        ${MAX_IMAGES} (0 = all)"
+echo "Test args:         ${TEST_ARGS}"
+
+# Pre-flight file checks.
+[[ -f "${SCRIPT_PATH}"        ]] || { echo "ERROR: script not found: ${SCRIPT_PATH}"; exit 1; }
+[[ -f "${SYSTEM_PROMPT_FILE}" ]] || { echo "ERROR: system prompt not found: ${SYSTEM_PROMPT_FILE}"; exit 1; }
+[[ -d "${MODEL_PATH}"         ]] || { echo "ERROR: model path not found: ${MODEL_PATH}"; exit 1; }
+
+echo "============================================================"
+echo "  PHASE 2: vLLM Server Launch (single node, TP=1, AWQ)"
+echo "  Time: $(date)"
+echo "============================================================"
+
+rm -f "${VLLM_LOG}"
+
+"${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server \
+    --model "${MODEL_PATH}" \
+    --served-model-name "${SERVED_MODEL_NAME}" \
+    --host 0.0.0.0 \
+    --port "${VLLM_PORT}" \
+    --tensor-parallel-size 1 \
+    --quantization awq \
+    --dtype float16 \
+    --trust-remote-code \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
+    --enforce-eager \
+    --limit-mm-per-prompt '{"image":15,"video":0}' \
+    --mm-processor-kwargs '{"max_dynamic_patch":4}' \
+    --chat-template ./models/awq/InternVL2_5-26B-AWQ/chat_template_fixed.jinja \
+    --enable-log-requests \
+    > "${VLLM_LOG}" 2>&1 &
+VLLM_PID=$!
+echo "vLLM PID: ${VLLM_PID}"
+echo "vLLM log: ${VLLM_LOG}"
+
+echo "Waiting for vLLM health endpoint..."
+READY=0
+for i in $(seq 1 120); do
+    if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
+        echo "ERROR: vLLM exited before becoming ready. Last 200 lines:"
+        tail -200 "${VLLM_LOG}" || true
+        exit 1
+    fi
+    if curl -s "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; then
+        READY=1
+        echo "vLLM server is ready after ~$((i * 10)) sec."
+        break
+    fi
+    echo "Waiting for vLLM... (${i}/120, $((i * 10)) sec)"
+    sleep 10
+done
+if [[ "${READY}" -ne 1 ]]; then
+    echo "ERROR: vLLM did not become ready in 20 min. Last 200 lines:"
+    tail -200 "${VLLM_LOG}" || true
+    exit 1
+fi
+
+echo "Available models:"
+curl -s "http://localhost:${VLLM_PORT}/v1/models" || true
+echo
+
+echo "============================================================"
+echo "  PHASE 3: Variant B Multimodal SRP Inference (${RUN_TAG})"
+echo "  Time: $(date)"
+echo "============================================================"
+
+cd "${CODE_DIR}"
+
+INFERENCE_CMD=(
+    "${PYTHON_BIN}" -u "${SCRIPT_PATH}"
+    --start-index "${START_INDEX}"
+    --end-index "${END_INDEX}"
+    --run-tag "${RUN_TAG}"
+    --max-images "${MAX_IMAGES}"
+)
+if [[ -n "${TEST_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA=( ${TEST_ARGS} )
+    INFERENCE_CMD+=("${EXTRA[@]}")
+fi
+
+echo "Inference command: ${INFERENCE_CMD[*]}"
+"${INFERENCE_CMD[@]}" 2>&1 | tee "${LIVE_LOG}"
+RUN_STATUS=${PIPESTATUS[0]}
+
+if [[ "${RUN_STATUS}" -ne 0 ]]; then
+    echo "ERROR: inference script failed with exit code ${RUN_STATUS}."
+    exit "${RUN_STATUS}"
+fi
+
+echo "============================================================"
+echo "  JOB COMPLETE (${RUN_TAG})  Time: $(date)"
+echo "============================================================"
+echo "SRPs:    ${SRP_DIR}"
+echo "Reports: ${REPORT_DIR} (results_${RUN_TAG}.csv)"
+echo "Logs:    ${LOG_DIR}"

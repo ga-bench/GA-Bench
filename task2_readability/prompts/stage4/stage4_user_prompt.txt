@@ -1,0 +1,162 @@
+Analyze the attached graphical abstract image and return exactly ONE JSON object with the
+following structure. Output the keys in this order. Replace every value with your analysis.
+Do not add, remove, or rename any key.
+
+{
+  "num_panels": <integer >= 1>,
+  "panel_structure": "simple" | "moderate" | "complex",
+  "layout_type": "single_panel" | "linear_flow" | "cyclic_flow" | "grid_panels" | "central_hub" | "comparison" | "freeform",
+  "main_reading_direction": "left_to_right" | "top_to_bottom" | "radial" | "circular" | "mixed" | "none",
+  "has_start_point": true | false,
+  "has_end_point": true | false,
+  "has_arrows_or_connectors": true | false,
+  "narrative_arc": "complete" | "partial" | "none",
+  "main_entities": [
+    {"name": "<transcribed label or short visual description>", "visual_role": "<short phrase e.g. input/model/sample/output/metric>"}
+  ],
+  "process_steps": ["<ordered short step>", "..."],
+  "relationships": [
+    {"from": "<entity>", "to": "<entity>", "type": "input_output" | "cause_effect" | "activation" | "inhibition" | "transformation" | "measurement" | "comparison" | "association" | "other"}
+  ],
+  "main_outcome": "<take-home message shown in the image, or empty string>",
+  "flow_clarity": "clear" | "partially_clear" | "unclear",
+  "entity_clarity": "clear" | "partially_clear" | "unclear",
+  "relation_clarity": "clear" | "partially_clear" | "unclear",
+  "main_message_identifiable": "yes" | "partially" | "no",
+  "visual_clutter": "low" | "medium" | "high",
+  "semantic_interpretability": "high" | "medium" | "low",
+  "method_identifiable": "yes" | "partially" | "no",
+  "result_identifiable": "yes" | "partially" | "no",
+  "conclusion_identifiable": "yes" | "partially" | "no",
+  "sequence_clarity_1to5": <integer 1-5>,
+  "key_message_clarity_1to5": <integer 1-5>,
+  "ambiguity_1to5": <integer 1-5>,
+  "text_dependency_1to5": <integer 1-5>,
+  "overall_interpretability_1to5": <integer 1-5>,
+  "unclear_elements": ["<illegible or confusing element>", "..."],
+  "missing_links": ["<gap in the visual flow>", "..."],
+  "uncertainty_notes": "<your main uncertainty, or empty string>"
+}
+
+FIELD GUIDANCE
+
+- "num_panels": Count of distinct visual panels or regions separated by borders, boxes, or
+  whitespace. A single uninterrupted illustration = 1. Example: a figure split into three
+  boxed sub-figures side by side -> 3.
+
+- "panel_structure": Overall layout complexity.
+  "simple" = 1-2 panels, easy to follow (e.g. one diagram with a caption).
+  "moderate" = 3-5 panels or a clear multi-part layout.
+  "complex" = many panels or densely packed sub-regions (e.g. a 6-box grid with sub-labels).
+
+- "layout_type": The dominant spatial arrangement.
+  "single_panel" = one undivided scene.
+  "linear_flow" = stages laid out in a line (e.g. sample -> assay -> result).
+  "cyclic_flow" = stages forming a loop (e.g. a carbon cycle).
+  "grid_panels" = a matrix/grid of panels.
+  "central_hub" = one central element with items radiating around it.
+  "comparison" = two or more items placed for side-by-side contrast (e.g. control vs treated).
+  "freeform" = scattered elements with no regular structure.
+
+- "main_reading_direction": The path the eye is meant to follow.
+  "left_to_right", "top_to_bottom", "radial" (out from a center), "circular" (around a loop),
+  "mixed" (more than one direction), "none" (no implied order). Example: arrows pointing
+  rightward across the image -> "left_to_right".
+
+- "has_start_point": true if a clear visual starting element exists (e.g. an "Input" box or a
+  labeled sample on the far left); otherwise false.
+
+- "has_end_point": true if a clear visual ending element exists (e.g. a "Result"/"Conclusion"
+  box or final outcome on the far right); otherwise false.
+
+- "has_arrows_or_connectors": true if arrows, lines, or connectors link elements; otherwise
+  false. Example: a flowchart with arrows -> true; a plain collage of icons -> false.
+
+- "narrative_arc": Whether the image tells a beginning-middle-end story.
+  "complete" = all three visible (e.g. problem -> method -> result).
+  "partial" = only some present (e.g. method and result, but no clear problem).
+  "none" = no progression, just a static scene or single concept.
+
+- "main_entities": Every clearly distinguishable object. "name" must be transcribed text
+  printed in the image OR a short visual description (do not infer identity of unlabeled
+  objects). "visual_role" is its function in the figure.
+  Example: [{"name": "CNN", "visual_role": "model"},
+            {"name": "MRI scan", "visual_role": "input"},
+            {"name": "accuracy 94%", "visual_role": "metric"}].
+  Use [] if no entities are identifiable.
+
+- "process_steps": Ordered workflow steps as short strings, in the order the image presents
+  them. Example: ["collect blood sample", "extract RNA", "sequence", "analyze expression"].
+  Use [] if no sequence is shown (e.g. a single static diagram).
+
+- "relationships": Visible links between two entities, with a relationship type.
+  "from"/"to" are entity names; "type" is the nature of the link.
+  Examples:
+    {"from": "drug", "to": "tumor", "type": "inhibition"}
+    {"from": "input image", "to": "model", "type": "input_output"}
+    {"from": "group A", "to": "group B", "type": "comparison"}.
+  Use [] if no relationships are visible.
+
+- "main_outcome": The single take-home message shown in the image, transcribed or
+  paraphrased from visible text/result. Example: "treatment reduced tumor size by 40%".
+  Use "" if no outcome is shown.
+
+- "flow_clarity": How clearly the reading path/flow can be followed.
+  "clear" = obvious arrows/order; "partially_clear" = some flow but gaps or crossings;
+  "unclear" = no discernible path.
+
+- "entity_clarity": How clearly the main entities are distinguishable and labeled.
+  "clear" = each entity is distinct and labeled; "partially_clear" = some unlabeled or
+  overlapping; "unclear" = entities blurred, tiny, or unidentifiable. Use "unclear" if no
+  entities are identifiable.
+
+- "relation_clarity": How clearly the relationships between entities are conveyed.
+  "clear" = links are explicit and labeled; "partially_clear" = links implied but not
+  explicit; "unclear" = relationships not conveyed. Use "unclear" if no relationships are
+  visible.
+
+- "main_message_identifiable": Can the GA's central point be grasped from the image alone?
+  "yes" = immediately; "partially" = with effort or only in part; "no" = not identifiable.
+
+- "visual_clutter": Density/overload of the visual.
+  "low" = clean with whitespace; "medium" = fairly busy; "high" = overcrowded, hard to parse.
+  Example: a packed image with many overlapping icons and text -> "high".
+
+- "semantic_interpretability": Overall, how well the scientific meaning comes across from the
+  image alone. "high" = meaning is clear; "medium" = partially clear; "low" = meaning unclear.
+
+- "method_identifiable": Can the method/approach/workflow be identified from the image alone?
+  "yes" = clearly shown (e.g. a labeled pipeline); "partially" = hinted; "no" = absent.
+
+- "result_identifiable": Can a result/finding be identified from the image alone?
+  "yes" = a chart/number/outcome is shown; "partially" = vague; "no" = no result shown.
+
+- "conclusion_identifiable": Can a conclusion/implication be identified from the image alone?
+  "yes" = stated or clearly implied; "partially" = weakly implied; "no" = absent.
+
+- "sequence_clarity_1to5": Order of steps. 1 = no discernible order; 3 = some order with
+  gaps; 5 = clear, unambiguous ordered sequence.
+
+- "key_message_clarity_1to5": Prominence of the main message. 1 = not apparent; 3 = found
+  with effort; 5 = main message instantly clear.
+
+- "ambiguity_1to5": Degree of ambiguity. 1 = no ambiguity; 3 = some ambiguous elements;
+  5 = highly ambiguous. HIGHER MEANS WORSE.
+
+- "text_dependency_1to5": Reliance on reading text to understand the figure. 1 = understandable
+  from visuals alone; 3 = some reading needed; 5 = cannot be understood without reading dense
+  text. HIGHER MEANS WORSE.
+
+- "overall_interpretability_1to5": Whole-image interpretability. 1 = not interpretable from the
+  image alone; 3 = partially interpretable; 5 = fully interpretable from the image alone.
+
+- "unclear_elements": Short strings naming specific confusing or illegible parts.
+  Example: ["tiny axis labels", "unlabeled blue arrow"]. Use [] if none.
+
+- "missing_links": Short strings naming gaps in the visual flow where a connection is expected
+  but absent. Example: ["no link between method and result panels"]. Use [] if none.
+
+- "uncertainty_notes": One short string describing your main uncertainty when analyzing this
+  image. Example: "text too small to read in bottom panel". Use "" if none.
+
+Return only the JSON object.

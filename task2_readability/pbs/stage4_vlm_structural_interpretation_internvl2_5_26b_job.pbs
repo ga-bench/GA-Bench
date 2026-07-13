@@ -1,0 +1,254 @@
+#!/bin/bash
+#PBS -N iv25_t2_s4
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -l walltime=240:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+
+###############################################################################
+# Task 2 / Stage 4 — VLM Structural Interpretation of Graphical Abstracts (INTERNVL2.5)
+# Model: InternVL2_5-26B-AWQ (4-bit AWQ). System role + trust-remote-code + custom chat template.
+# Infra: SINGLE node, 1 GPU (A100 40GB), vLLM TP=1, NO Ray.
+#
+# Submit as TWO jobs (each its own node), passing only HALF:
+#   qsub -v HALF=1 stage4_vlm_structural_interpretation_job.pbs
+#   qsub -v HALF=2 stage4_vlm_structural_interpretation_job.pbs
+#
+# The Python script shards the GA list into HALVES internally (--num-splits 2
+# --split-id HALF). interpretations/raw/errors are per-paper and shared;
+# reports + checkpoint are per-half via RUN_TAG so the two jobs never clobber.
+#
+# SMOKE TEST first on one node:  set TEST_ARGS="--limit 20"  (applied within the half)
+# Then 100-sample calibration:   set TEST_ARGS="--limit 100"  and inspect the
+#   field-distribution report BEFORE launching the full run with TEST_ARGS="".
+###############################################################################
+
+set -euo pipefail
+ulimit -n 65535 2>/dev/null || true
+
+HALF="${HALF:?Submit with -v HALF=1 or -v HALF=2}"
+
+# ----------------------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------------------
+PROJECT_ROOT="./task2_readability"
+
+CODE_DIR="${PROJECT_ROOT}/codes"
+PBS_DIR="${PROJECT_ROOT}/pbs"
+PROMPT_DIR="${PROJECT_ROOT}/prompts/stage4"
+OUTPUT_DIR="${PROJECT_ROOT}/output/stage4_vlm_internvl2_5_26b"
+LOG_DIR="${OUTPUT_DIR}/logs"
+REPORT_DIR="${OUTPUT_DIR}/reports"
+INTERP_DIR="${OUTPUT_DIR}/interpretations"
+RAW_DIR="${OUTPUT_DIR}/raw_outputs"
+ERROR_DIR="${OUTPUT_DIR}/errors"
+SUMMARY_DIR="${OUTPUT_DIR}/summaries"
+CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
+
+SCRIPT_PATH="${CODE_DIR}/stage4_vlm_structural_interpretation_internvl2_5_26b.py"
+SYSTEM_PROMPT_FILE="${PROMPT_DIR}/stage4_system_prompt.txt"
+USER_PROMPT_FILE="${PROMPT_DIR}/stage4_user_prompt.txt"
+STAGE1_INDEX="${PROJECT_ROOT}/output/stage1_preprocessing/index/stage1_ga_index.csv"
+
+# AWQ env (same one used by the Task 1 Qwen3-VL run).
+ENV_DIR="./environments/llm_env_awq"
+PYTHON_BIN="${ENV_DIR}/bin/python3"
+PYTHON_INCLUDE="./environments/llm_env/include/python3.12"
+
+MODEL_PATH="./models/awq/InternVL2_5-26B-AWQ"
+SERVED_MODEL_NAME="internvl2_5_26b"
+CHAT_TEMPLATE="./models/awq/InternVL2_5-26B-AWQ/chat_template_fixed.jinja"
+VLLM_PORT="8000"
+
+# InternVL2.5 AWQ settings (Task 1). awq quant + float16 + trust-remote-code + chat template.
+MAX_MODEL_LEN="40960"
+MAX_NUM_SEQS="1"
+GPU_MEMORY_UTILIZATION="0.95"
+
+# Inference controls. Full run: TEST_ARGS=""
+# Smoke: TEST_ARGS="--limit 20"  |  Calibration: TEST_ARGS="--limit 100"
+TEST_ARGS=""
+PY_CONCURRENCY="1"          # keep == MAX_NUM_SEQS; raise both only if GPU is stable
+MAX_TOKENS="8192"
+TEMPERATURE="0"
+MAX_IMAGE_DIM="1280"
+CLIENT_TIMEOUT="900"
+
+mkdir -p "${LOG_DIR}" "${REPORT_DIR}" "${INTERP_DIR}" "${RAW_DIR}" "${ERROR_DIR}" \
+         "${SUMMARY_DIR}" "${CHECKPOINT_DIR}" "${PBS_DIR}"
+
+# ----------------------------------------------------------------------------
+# HALF -> split id + run tag
+# ----------------------------------------------------------------------------
+if [[ "${HALF}" == "1" ]]; then
+    SPLIT_ID=1; RUN_TAG="h1"
+elif [[ "${HALF}" == "2" ]]; then
+    SPLIT_ID=2; RUN_TAG="h2"
+else
+    echo "ERROR: HALF must be 1 or 2 (got '${HALF}')"; exit 1
+fi
+NUM_SPLITS=2
+
+VLLM_LOG="${LOG_DIR}/vllm_server_${RUN_TAG}.log"
+LIVE_LOG="${LOG_DIR}/live_inference_${RUN_TAG}.log"
+JOB_LOG="${LOG_DIR}/job_${RUN_TAG}.log"
+
+exec > >(tee -a "${JOB_LOG}") 2>&1
+
+cleanup() {
+    echo
+    echo "============================================================"
+    echo "  CLEANUP (${RUN_TAG})  Time: $(date)"
+    echo "============================================================"
+    if [[ -n "${VLLM_PID:-}" ]]; then
+        if kill -0 "${VLLM_PID}" 2>/dev/null; then
+            echo "Stopping vLLM server PID ${VLLM_PID}..."
+            kill "${VLLM_PID}" 2>/dev/null || true
+            sleep 5
+            kill -9 "${VLLM_PID}" 2>/dev/null || true
+        fi
+    fi
+    rm -rf "${_LOCAL_SCRATCH:-/nonexistent}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo "============================================================"
+echo "  PHASE 1: Environment Setup  (HALF=${HALF}, tag=${RUN_TAG})"
+echo "  Time: $(date)"
+echo "============================================================"
+
+source "${ENV_DIR}/bin/activate"
+
+# Node-local scratch + caches (Lustre intermittently rejects triton/inductor cache dirs).
+_LOCAL_SCRATCH="/tmp/${USER}_t2s4_internvl_${RUN_TAG}_${PBS_JOBID%%.*}"
+export TMPDIR="${_LOCAL_SCRATCH}/tmp"
+export TRITON_CACHE_DIR="${_LOCAL_SCRATCH}/triton"
+export TORCHINDUCTOR_CACHE_DIR="${_LOCAL_SCRATCH}/torchinductor"
+export XDG_CACHE_HOME="${_LOCAL_SCRATCH}/xdg"
+export HF_HOME="./.cache/huggingface"
+mkdir -p "${TMPDIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${XDG_CACHE_HOME}" "${HF_HOME}"
+
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_TORCH_COMPILE_LEVEL=0
+export TORCH_COMPILE_DISABLE=1
+export C_INCLUDE_PATH="${PYTHON_INCLUDE}:${C_INCLUDE_PATH:-}"
+export CPATH="${PYTHON_INCLUDE}:${CPATH:-}"
+
+echo "Hostname:        $(hostname)"
+echo "PBS job id:      ${PBS_JOBID:-unknown}"
+echo "HALF / tag:      ${HALF} / ${RUN_TAG}"
+echo "Split:           ${SPLIT_ID}/${NUM_SPLITS}"
+echo "Python:          $(${PYTHON_BIN} --version 2>&1)"
+echo "vLLM:            $(${PYTHON_BIN} -c 'import vllm; print(vllm.__version__)')"
+echo "Model path:      ${MODEL_PATH}"
+echo "Script path:     ${SCRIPT_PATH}"
+echo "Stage1 index:    ${STAGE1_INDEX}"
+echo "System prompt:   ${SYSTEM_PROMPT_FILE}"
+echo "User prompt:     ${USER_PROMPT_FILE}"
+echo "Output dir:      ${OUTPUT_DIR}"
+echo "Max model len:   ${MAX_MODEL_LEN}"
+echo "Max image dim:   ${MAX_IMAGE_DIM}"
+echo "Test args:       ${TEST_ARGS}"
+
+# Pre-flight checks.
+[[ -f "${SCRIPT_PATH}"        ]] || { echo "ERROR: script not found: ${SCRIPT_PATH}"; exit 1; }
+[[ -f "${SYSTEM_PROMPT_FILE}" ]] || { echo "ERROR: system prompt not found: ${SYSTEM_PROMPT_FILE}"; exit 1; }
+[[ -f "${USER_PROMPT_FILE}"   ]] || { echo "ERROR: user prompt not found: ${USER_PROMPT_FILE}"; exit 1; }
+[[ -f "${STAGE1_INDEX}"       ]] || { echo "ERROR: stage1 index not found: ${STAGE1_INDEX}"; exit 1; }
+[[ -d "${MODEL_PATH}"         ]] || { echo "ERROR: model path not found: ${MODEL_PATH}"; exit 1; }
+[[ -f "${CHAT_TEMPLATE}"      ]] || { echo "ERROR: chat template not found: ${CHAT_TEMPLATE}"; exit 1; }
+
+echo "============================================================"
+echo "  PHASE 2: vLLM Server Launch (single node, TP=1, AWQ, trust-remote-code, multimodal)"
+echo "  Time: $(date)"
+echo "============================================================"
+
+rm -f "${VLLM_LOG}"
+
+"${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server \
+    --model "${MODEL_PATH}" \
+    --served-model-name "${SERVED_MODEL_NAME}" \
+    --host 0.0.0.0 \
+    --port "${VLLM_PORT}" \
+    --tensor-parallel-size 1 \
+    --quantization awq \
+    --dtype float16 \
+    --trust-remote-code \
+    --chat-template "${CHAT_TEMPLATE}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
+    --enforce-eager \
+    --limit-mm-per-prompt '{"image":1,"video":0}' \
+    --enable-log-requests \
+    > "${VLLM_LOG}" 2>&1 &
+VLLM_PID=$!
+echo "vLLM PID: ${VLLM_PID}"
+echo "vLLM log: ${VLLM_LOG}"
+
+echo "Waiting for vLLM health endpoint..."
+READY=0
+for i in $(seq 1 120); do
+    if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
+        echo "ERROR: vLLM exited before becoming ready. Last 200 lines:"
+        tail -200 "${VLLM_LOG}" || true
+        exit 1
+    fi
+    if curl -s "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; then
+        READY=1
+        echo "vLLM server is ready after ~$((i * 10)) sec."
+        break
+    fi
+    echo "Waiting for vLLM... (${i}/120, $((i * 10)) sec)"
+    sleep 10
+done
+if [[ "${READY}" -ne 1 ]]; then
+    echo "ERROR: vLLM did not become ready in 20 min. Last 200 lines:"
+    tail -200 "${VLLM_LOG}" || true
+    exit 1
+fi
+
+echo "Available models:"
+curl -s "http://localhost:${VLLM_PORT}/v1/models" || true
+echo
+
+echo "============================================================"
+echo "  PHASE 3: Running Stage 4 Inference (${RUN_TAG})"
+echo "  Time: $(date)"
+echo "============================================================"
+
+INFERENCE_CMD=(
+    "${PYTHON_BIN}" -u "${SCRIPT_PATH}"
+    --num-splits "${NUM_SPLITS}"
+    --split-id "${SPLIT_ID}"
+    --run-tag "${RUN_TAG}"
+    --concurrency "${PY_CONCURRENCY}"
+    --max-tokens "${MAX_TOKENS}"
+    --temperature "${TEMPERATURE}"
+    --max-image-dim "${MAX_IMAGE_DIM}"
+    --timeout "${CLIENT_TIMEOUT}"
+    --vllm-url "http://localhost:${VLLM_PORT}"
+)
+if [[ -n "${TEST_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA=( ${TEST_ARGS} )
+    INFERENCE_CMD+=("${EXTRA[@]}")
+fi
+
+echo "Inference command: ${INFERENCE_CMD[*]}"
+"${INFERENCE_CMD[@]}" 2>&1 | tee "${LIVE_LOG}"
+RUN_STATUS=${PIPESTATUS[0]}
+
+if [[ "${RUN_STATUS}" -ne 0 ]]; then
+    echo "ERROR: inference script failed with exit code ${RUN_STATUS}."
+    exit "${RUN_STATUS}"
+fi
+
+echo "============================================================"
+echo "  JOB COMPLETE (${RUN_TAG})  Time: $(date)"
+echo "============================================================"
+echo "Interpretations: ${INTERP_DIR}"
+echo "Reports:         ${REPORT_DIR} (results_${RUN_TAG}.csv, field_distributions_${RUN_TAG}.json)"
+echo "Logs:            ${LOG_DIR}"

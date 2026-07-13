@@ -1,0 +1,238 @@
+#!/bin/bash
+#PBS -N g327_t1_bnv
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -l walltime=240:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+
+###############################################################################
+# Task 1 Baseline: Naive VLM Judge  (GA image ONLY, no SRP, no variant)
+# Model: Qwen3-VL-32B-Instruct-AWQ (4-bit AWQ)
+# Infra: SINGLE node, 1 GPU (A100 40GB), vLLM TP=1, NO Ray.
+# GA image is sent as base64 by the Python script (no --allowed-local-media-path).
+#
+# Submit per HALF (1 or 2). Each gets its own node:
+#   qsub -v HALF=1 task1_baseline_naive_vlm_gemma_3_27b_job.pbs
+#   qsub -v HALF=2 task1_baseline_naive_vlm_gemma_3_27b_job.pbs
+#
+# Auto-counts complete_dois.txt and splits the index range in half.
+# Judgments/raw/errors are shared (per-DOI, no overlap); reports+checkpoint are
+# per-half via RUN_TAG so the two jobs never clobber each other.
+###############################################################################
+
+set -euo pipefail
+ulimit -n 65535 2>/dev/null || true
+
+HALF="${HALF:?Submit with -v HALF=1 or HALF=2}"
+
+# ----------------------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------------------
+PROJECT_BASE="./task1_completeness_awq"
+BASELINE_BASE="${PROJECT_BASE}/baselines/naive_vlm"
+SHARED_DIR="${BASELINE_BASE}/shared"
+
+CODE_DIR="${SHARED_DIR}/codes"
+PBS_DIR="${SHARED_DIR}/pbs"
+OUTPUT_DIR="${BASELINE_BASE}/gemma_3_27b"
+LOG_DIR="${OUTPUT_DIR}/logs"
+REPORT_DIR="${OUTPUT_DIR}/reports"
+JUDGMENT_DIR="${OUTPUT_DIR}/judgments"
+RAW_DIR="${OUTPUT_DIR}/raw_outputs"
+ERROR_DIR="${OUTPUT_DIR}/errors"
+CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
+
+SCRIPT_PATH="${CODE_DIR}/task1_baseline_naive_vlm_gemma_3_27b_inference.py"
+SYSTEM_PROMPT_FILE="${SHARED_DIR}/system_prompts/naive_vlm_system_prompt.txt"
+COMPLETE_DOIS_FILE="${PROJECT_BASE}/complete_dois.txt"
+GA_IMAGE_CSV="./task2_readability/output/stage1_preprocessing/index/stage1_ga_index.csv"
+
+# AWQ env (same as Stage 1).
+ENV_DIR="./environments/llm_env_awq"
+PYTHON_BIN="${ENV_DIR}/bin/python3"
+PYTHON_INCLUDE="./environments/llm_env/include/python3.12"
+
+MODEL_PATH="./models/awq/gemma-3-27b-it-w4a16"
+SERVED_MODEL_NAME="gemma_3_27b"
+VLLM_PORT="8000"
+
+MAX_MODEL_LEN="53248"
+MAX_NUM_SEQS="1"
+GPU_MEMORY_UTILIZATION="0.95"
+
+# Full run: TEST_ARGS=""   Test: TEST_ARGS="--limit 1"  (applied WITHIN this half's range)
+TEST_ARGS=""
+
+mkdir -p "${LOG_DIR}" "${REPORT_DIR}" "${JUDGMENT_DIR}" "${RAW_DIR}" "${ERROR_DIR}" "${CHECKPOINT_DIR}" "${PBS_DIR}" "${SHARED_DIR}/logs"
+
+# ----------------------------------------------------------------------------
+# Compute this half's index range from the complete-DOIs line count
+# ----------------------------------------------------------------------------
+if [[ ! -f "${COMPLETE_DOIS_FILE}" ]]; then
+    echo "ERROR: complete_dois file not found: ${COMPLETE_DOIS_FILE}"; exit 1
+fi
+TOTAL=$(grep -cve '^[[:space:]]*$' "${COMPLETE_DOIS_FILE}")
+if [[ "${TOTAL}" -le 0 ]]; then
+    echo "ERROR: No DOIs in ${COMPLETE_DOIS_FILE}"; exit 1
+fi
+MID=$(( TOTAL / 2 ))
+if [[ "${HALF}" == "1" ]]; then
+    START_INDEX=0;       END_INDEX=${MID};    RUN_TAG="h1"
+elif [[ "${HALF}" == "2" ]]; then
+    START_INDEX=${MID};  END_INDEX=${TOTAL};  RUN_TAG="h2"
+else
+    echo "ERROR: HALF must be 1 or 2 (got '${HALF}')"; exit 1
+fi
+
+# Per-(variant,half) logs so jobs never clobber each other.
+VLLM_LOG="${LOG_DIR}/vllm_server_${RUN_TAG}.log"
+LIVE_LOG="${LOG_DIR}/live_inference_${RUN_TAG}.log"
+JOB_LOG="${LOG_DIR}/job_${RUN_TAG}.log"
+
+exec > >(tee -a "${JOB_LOG}") 2>&1
+
+cleanup() {
+    echo
+    echo "============================================================"
+    echo "  CLEANUP (${RUN_TAG})  Time: $(date)"
+    echo "============================================================"
+    if [[ -n "${VLLM_PID:-}" ]]; then
+        if kill -0 "${VLLM_PID}" 2>/dev/null; then
+            echo "Stopping vLLM server PID ${VLLM_PID}..."
+            kill "${VLLM_PID}" 2>/dev/null || true
+            sleep 5
+            kill -9 "${VLLM_PID}" 2>/dev/null || true
+        fi
+    fi
+    rm -rf "${_LOCAL_SCRATCH:-/nonexistent}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo "============================================================"
+echo "  PHASE 1: Environment Setup  (HALF=${HALF}, tag=${RUN_TAG})"
+echo "  Time: $(date)"
+echo "============================================================"
+
+source "${ENV_DIR}/bin/activate"
+
+_LOCAL_SCRATCH="/tmp/${USER}_bnv_${RUN_TAG}_${PBS_JOBID%%.*}"
+export TMPDIR="${_LOCAL_SCRATCH}/tmp"
+export TRITON_CACHE_DIR="${_LOCAL_SCRATCH}/triton"
+export TORCHINDUCTOR_CACHE_DIR="${_LOCAL_SCRATCH}/torchinductor"
+export XDG_CACHE_HOME="${_LOCAL_SCRATCH}/xdg"
+export HF_HOME="./.cache/huggingface"
+mkdir -p "${TMPDIR}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${XDG_CACHE_HOME}" "${HF_HOME}"
+
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_TORCH_COMPILE_LEVEL=0
+export TORCH_COMPILE_DISABLE=1
+export C_INCLUDE_PATH="${PYTHON_INCLUDE}:${C_INCLUDE_PATH:-}"
+export CPATH="${PYTHON_INCLUDE}:${CPATH:-}"
+
+echo "Hostname:          $(hostname)"
+echo "PBS job id:        ${PBS_JOBID:-unknown}"
+echo "HALF / tag:        ${HALF} / ${RUN_TAG}"
+echo "Total DOIs:        ${TOTAL}"
+echo "Index range:       [${START_INDEX}, ${END_INDEX})"
+echo "Python:            $(${PYTHON_BIN} --version 2>&1)"
+echo "vLLM:              $(${PYTHON_BIN} -c 'import vllm; print(vllm.__version__)')"
+echo "Model path:        ${MODEL_PATH}"
+echo "Script path:       ${SCRIPT_PATH}"
+echo "System prompt:     ${SYSTEM_PROMPT_FILE}"
+echo "GA image CSV:      ${GA_IMAGE_CSV}"
+echo "Output dir:        ${OUTPUT_DIR}"
+
+# Pre-flight checks.
+[[ -f "${SCRIPT_PATH}"        ]] || { echo "ERROR: script not found: ${SCRIPT_PATH}"; exit 1; }
+[[ -f "${SYSTEM_PROMPT_FILE}" ]] || { echo "ERROR: system prompt not found: ${SYSTEM_PROMPT_FILE}"; exit 1; }
+[[ -f "${GA_IMAGE_CSV}"       ]] || { echo "ERROR: GA image CSV not found: ${GA_IMAGE_CSV}"; exit 1; }
+[[ -d "${MODEL_PATH}"         ]] || { echo "ERROR: model path not found: ${MODEL_PATH}"; exit 1; }
+
+echo "============================================================"
+echo "  PHASE 2: vLLM Server Launch (single node, TP=1, AWQ)"
+echo "  Time: $(date)"
+echo "============================================================"
+
+rm -f "${VLLM_LOG}"
+
+"${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server \
+    --model "${MODEL_PATH}" \
+    --served-model-name "${SERVED_MODEL_NAME}" \
+    --host 0.0.0.0 \
+    --port "${VLLM_PORT}" \
+    --tensor-parallel-size 1 \
+    --quantization compressed-tensors \
+    --dtype bfloat16 \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+    --max-num-seqs "${MAX_NUM_SEQS}" \
+    --enforce-eager \
+    --limit-mm-per-prompt '{"image":2,"video":0}' \
+    --enable-log-requests \
+    > "${VLLM_LOG}" 2>&1 &
+VLLM_PID=$!
+echo "vLLM PID: ${VLLM_PID}"
+echo "vLLM log: ${VLLM_LOG}"
+
+echo "Waiting for vLLM health endpoint..."
+READY=0
+for i in $(seq 1 120); do
+    if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
+        echo "ERROR: vLLM exited before becoming ready. Last 200 lines:"
+        tail -200 "${VLLM_LOG}" || true
+        exit 1
+    fi
+    if curl -s "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; then
+        READY=1
+        echo "vLLM server is ready after ~$((i * 10)) sec."
+        break
+    fi
+    echo "Waiting for vLLM... (${i}/120, $((i * 10)) sec)"
+    sleep 10
+done
+if [[ "${READY}" -ne 1 ]]; then
+    echo "ERROR: vLLM did not become ready in 20 min. Last 200 lines:"
+    tail -200 "${VLLM_LOG}" || true
+    exit 1
+fi
+
+echo "Available models:"
+curl -s "http://localhost:${VLLM_PORT}/v1/models" || true
+echo
+
+echo "============================================================"
+echo "  PHASE 3: Naive VLM Judge Baseline (${RUN_TAG})"
+echo "  Time: $(date)"
+echo "============================================================"
+
+cd "${CODE_DIR}"
+
+INFERENCE_CMD=(
+    "${PYTHON_BIN}" -u "${SCRIPT_PATH}"
+    --start-index "${START_INDEX}"
+    --end-index "${END_INDEX}"
+    --run-tag "${RUN_TAG}"
+)
+if [[ -n "${TEST_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA=( ${TEST_ARGS} )
+    INFERENCE_CMD+=("${EXTRA[@]}")
+fi
+
+echo "Inference command: ${INFERENCE_CMD[*]}"
+"${INFERENCE_CMD[@]}" 2>&1 | tee "${LIVE_LOG}"
+RUN_STATUS=${PIPESTATUS[0]}
+
+if [[ "${RUN_STATUS}" -ne 0 ]]; then
+    echo "ERROR: inference script failed with exit code ${RUN_STATUS}."
+    exit "${RUN_STATUS}"
+fi
+
+echo "============================================================"
+echo "  JOB COMPLETE (${RUN_TAG})  Time: $(date)"
+echo "============================================================"
+echo "Judgments: ${JUDGMENT_DIR}"
+echo "Reports: ${REPORT_DIR} (results_${RUN_TAG}.csv)"
+echo "Logs:    ${LOG_DIR}"

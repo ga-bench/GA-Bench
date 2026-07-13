@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -N task1_variantA_phase1_prompt_builder
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -o ./logs/job.out
+
+set -euo pipefail
+
+WORK_DIR="./prompt_builders"
+OUTPUT_DIR="${WORK_DIR}/output"
+
+mkdir -p "${OUTPUT_DIR}"
+
+cd "${WORK_DIR}"
+
+echo "============================================================"
+echo "Starting task1_variantA_phase1_prompt_builder job"
+echo "Date: $(date)"
+echo "Host: $(hostname)"
+echo "Work dir: ${WORK_DIR}"
+echo "Output dir: ${OUTPUT_DIR}"
+echo "============================================================"
+
+./environments/llm_env/bin/python3 -u task1_variantA_phase1_prompt_builder.py
+
+echo "============================================================"
+echo "Finished task1_variantA_phase1_prompt_builder job"
+echo "Date: $(date)"
+echo "============================================================"
